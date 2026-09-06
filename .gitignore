@@ -1,0 +1,68 @@
+# =============================================================================
+# Raíz del repo: cobertura general (Python, secrets, datos, logs, binarios).
+# El .gitignore del Worker añade reglas específicas si hicieran falta.
+# =============================================================================
+
+# --- Secrets y entorno ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+credentials.json
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+venv/
+env/
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# --- IDEs / editores ---
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# --- Sistema operativo ---
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- Datos generados por el Worker ---
+data/
+logs/
+*.log
+worker_run.log
+
+# --- Vídeos y binarios grandes ---
+*.mp4
+*.mov
+*.mkv
+*.avi
+*.webm
+*.wav
+*.mp3
+*.flac
+*.srt
+*.vtt
+
+# --- Salidas de smoke tests locales ---
+test_render_payload.json
+body_*.json
+body_*.json.tmp
+send_*.ps1
+check_*.ps1
+
+# --- HANDOFF viejo (redundante con AGENTS.md y docs/) ---
+HANDOFF*.md

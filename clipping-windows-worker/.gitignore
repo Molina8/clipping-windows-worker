@@ -1,0 +1,21 @@
+# Entorno
+.env
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+
+# Datos generados
+data/
+*.mp4
+*.wav
+*.json
+
+# Tests / tooling
+.pytest_cache/
+.coverage
+htmlcov/
+
+# IDE
+.idea/
+.vscode/
