@@ -76,6 +76,18 @@ class Settings(BaseSettings):
     )
 
     # --------------------------------------------------------------
+    # Storage de clips (Step 18 architecture_flow.md)
+    # --------------------------------------------------------------
+
+    clip_storage_root: Path = Field(
+        default=Path(r"C:\CODIANT\clipping\storage\clips"),
+        description=(
+            "Carpeta raíz del almacenamiento por campaña. El QA job "
+            "copia los clips aprobados a <root>/<campaign_id>/pending_upload/."
+        ),
+    )
+
+    # --------------------------------------------------------------
     # GPU / WhisperX
     # --------------------------------------------------------------
 
