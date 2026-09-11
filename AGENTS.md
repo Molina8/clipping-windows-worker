@@ -103,7 +103,8 @@ No debe confundirse el diseño con la implementación comprobada. Antes de afirm
 | **Worker (Download)** | Windows | Validado | Descarga vídeos por streaming (`FileManager`) |
 | **Worker (WhisperX)** | Windows | Validado E2E | Transcripción GPU `large-v3` + alineamiento |
 | **Worker (FFmpeg/Render)** | Windows | Validado local | Recorte + escalado 16:9/9:16, watermark y captions opcionales |
-| **Worker (QA)** | Windows | Validado local | Validación determinista con `ffprobe` |
+| **Worker (QA)** | Windows | Validado local | Validación determinista con `ffprobe`. Step 18: tras PASS copia el clip a `pending_upload/` y reporta `final_path_worker` |
+| **Worker (Step 18 — Clip Storage)** | Windows | Validado local | `ClipStorage` organiza clips por `campaign_id` en `pending_upload/`, `uploaded/`, `archived/` (`<clip_storage_root>\<campaign_id>\<location>\<clip_id>.mp4`) |
 | **Upload results** | Windows | Validado | `POST /worker/jobs/{id}/result` con `{"result": ...}` |
 | **Revisión humana + Publicación** | Fuera del flujo Worker | Pendiente | Bot de Telegram y panel web |
 
@@ -215,6 +216,9 @@ Contrato del job `download` no cambia. Detalle completo en `HANDOFF — Clipping
   - Path Windows (`C:\...`) o Tailscale (`\\VPS\share\...`) → VPS no verifica, el Worker valida al procesar.
 - **OpenAPI se regenera automáticamente** con FastAPI; cualquier cambio en `JobCreate` se refleja en `/openapi.json`.
 - **Persistencia:** `result.data` se guarda tal cual en `jobs.result` y `error_message` se persiste en caso de fail.
+- **Step 18 — Sanitiser de `clip_id`:** `_safe_filename` preserva UUIDs con guiones literales; sólo bloquea caracteres prohibidos por Windows (`<>:"/\|?*` + control chars `\x00-\x1f`). Bloquea `.`, `..` y separadores por seguridad. Esto es crítico: `final_path_worker` debe coincidir con el `clip_id` literal para que el VPS resuelva el archivo.
+- **Step 18 — `clip_storage_root`:** configurable vía `.env` (`clip_storage_root=...`), default `C:\CODIANT\clipping\storage\clips`. Tres subdirectorios `pending_upload/`, `uploaded/`, `archived/` se crean idempotentemente en el primer job.
+- **Step 18 — Robustez:** fallos de `_copy_to_pending_upload` (permisos, disco lleno, paths inválidos) se loggean como warning y devuelven `source_moved: false` sin propagar al QA. La transición de estado en el VPS (`on_qa_completed`) está envuelta en try/except, así que el Step 18 nunca rompe el flujo de QA.
 
 ## Contratos de jobs del Worker
 
@@ -271,7 +275,7 @@ Acepta también `"video_path"` por retrocompatibilidad. `result.data`:
 {"output_path":"...\\clip.mp4","filename":"clip.mp4","size":1272676,"format":"16:9"}
 ```
 
-### `qa` (validado localmente)
+### `qa` (validado localmente, extendido con Step 18)
 
 ```json
 {
@@ -286,7 +290,9 @@ Acepta también `"video_path"` por retrocompatibilidad. `result.data`:
       "min_fps": 24,
       "require_audio": true,
       "codec": "h264"
-    }
+    },
+    "clip_id": "a875ad94-de7f-4af7-ad3c-834becbd0420",
+    "campaign_id": 5463
   },
   "priority": 5
 }
@@ -294,21 +300,48 @@ Acepta también `"video_path"` por retrocompatibilidad. `result.data`:
 
 - Reglas opcionales: omitir las que no apliquen.
 - Determinista: usa `ffprobe` para duration, resolución, fps, codec y audio.
+- Campos opcionales para Step 18: `clip_id` (UUID string; acepta alias `clip_uuid`/`clipId`) y `campaign_id` (int o str). Si el QA pasa y ambos están presentes, el Worker copia el clip a `<clip_storage_root>/<campaign_id>/pending_upload/<clip_id>.mp4` y devuelve `final_path_worker`.
+- Si `clip_id` o `campaign_id` faltan, el QA se ejecuta y devuelve `source_moved: false` con un warning; el flujo nunca falla por esta razón.
 
 `result.data`:
 
 ```json
 {
-  "status":"PASS",
-  "checks":[
-    {"name":"duration","status":"PASS","actual":10.0,"expected":"9.5-10.5"},
-    {"name":"resolution","status":"PASS","actual":"1920x1080","expected":"1920x1080"},
-    {"name":"fps","status":"PASS","actual":60.0,"expected":">=24"},
-    {"name":"audio","status":"PASS","actual":true,"expected":true},
-    {"name":"codec","status":"PASS","actual":"h264","expected":"h264"}
-  ]
+  "status": "PASS",
+  "checks": [
+    {"name": "duration", "status": "PASS", "actual": 10.0, "expected": "9.5-10.5"},
+    {"name": "resolution", "status": "PASS", "actual": "1920x1080", "expected": "1920x1080"},
+    {"name": "fps", "status": "PASS", "actual": 60.0, "expected": ">=24"},
+    {"name": "audio", "status": "PASS", "actual": true, "expected": true},
+    {"name": "codec", "status": "PASS", "actual": "h264", "expected": "h264"}
+  ],
+  "duration_seconds": 10.0,
+  "final_path_worker": "C:\\CODIANT\\clipping\\storage\\clips\\5463\\pending_upload\\a875ad94-de7f-4af7-ad3c-834becbd0420.mp4",
+  "source_moved": true
 }
 ```
+
+| Campo | Tipo | Presente cuando |
+|---|---|---|
+| `status` | `"PASS"` \| `"FAIL"` | siempre |
+| `checks` | list | siempre |
+| `duration_seconds` | number | siempre (top-level) |
+| `final_path_worker` | string | PASS + `clip_id` + `campaign_id` + copia exitosa |
+| `source_moved` | bool | siempre (`true` solo si se copió) |
+
+## Step 18 — Almacenamiento por campaña (validado localmente)
+
+- **Layout:** `<clip_storage_root>\<campaign_id>\{pending_upload|uploaded|archived}\<clip_id>.mp4`.
+- **`clip_storage_root`** por defecto: `C:\CODIANT\clipping\storage\clips`. Configurable vía env `clip_storage_root` en `.env` del Worker.
+- **Worker** ([clip_storage.py](clipping-windows-worker/app/utils/clip_storage.py)): helper `ClipStorage` con `ensure()` (idempotente), `copy_to_pending_upload()` (sobre-escribe si existe, conserva el original por ahora) y `move()` (pendiente para transiciones futuras). `_safe_filename` preserva el `clip_id` literal (UUID con guiones) y sólo sustituye por `_` los caracteres prohibidos en Windows (`<>:"/\|?*` + control chars).
+- **VPS** ([clip_storage_service.py](clipping-vps/clipping-system-vps/app/services/clip_storage_service.py) + [clips.py](clipping-vps/clipping-system-vps/app/api/clips.py)): `on_qa_completed` en [job_state_transitions.py](clipping-vps/clipping-system-vps/app/services/job_state_transitions.py) lee `result.data["final_path_worker"]` y llama `set_clip_location(db, clip.id, "pending_upload", final_path_worker=…)`. Try/except garantiza que un error de storage nunca rompe el QA.
+- **Endpoints VPS ya disponibles:**
+  - `GET /clips/by_campaign/{campaign_id}/storage?location=…` listar.
+  - `POST /clips/{clip_id}/mark_uploaded?final_path_worker=…` mover a `uploaded` (+ `published_at`).
+  - `POST /clips/{clip_id}/location/{location}?final_path_worker=…` cambiar manualmente.
+- **Tres localizaciones alineadas** entre VPS (`VALID_LOCATIONS`) y Worker (`ClipStorage._LOCATIONS`): `pending_upload`, `uploaded`, `archived`.
+- **Validación local Worker:** `python test_qa_local.py {legacy|step18|fail-no-copy|all}`. `step18` valida copia correcta, `final_path_worker` apunta al archivo, `source_moved=true`, `source_intact=true`. `legacy` valida compat sin `clip_id`. `fail-no-copy` valida que QA FAIL no copia.
+- **Regresión:** `pytest tests/` → 27/27 PASS tras el cambio.
 
 ## División de trabajo actual
 
@@ -330,6 +363,17 @@ Acepta también `"video_path"` por retrocompatibilidad. `result.data`:
 **Próximo paso desde Windows:** lanzar el curl de prueba, observar logs del Worker, validar que el job pasa `pending → assigned → processing → completed` y que `result.data` llega con `language=es`, `duration=598.0`, `segments`, `words`.
 
 **Si algo falla:** pasar a OpenClaw el curl exacto lanzado + respuesta del servidor.
+
+## Estado del Step 18 (Worker, validado localmente 11/09/2026)
+
+- ✅ `ClipStorage` helper creado en [clip_storage.py](clipping-windows-worker/app/utils/clip_storage.py): `ensure()` idempotente, `copy_to_pending_upload()` preserva origen, sanitiser conserva UUIDs con guiones.
+- ✅ `QAJob.execute()` extendido: tras PASS copia a `<clip_storage_root>/<campaign_id>/pending_upload/<clip_id>.mp4` y devuelve `final_path_worker` + `source_moved=true`.
+- ✅ Settings: `clip_storage_root` configurable vía `.env` (default `C:\CODIANT\clipping\storage\clips`).
+- ✅ `test_qa_local.py all` → 6/6 + 3/3 + 5/5 PASS (legacy, step18, fail-no-copy).
+- ✅ `pytest tests/` → 27/27 PASS (sin regresión).
+- ✅ VPS ya cableado: `on_qa_completed` lee `final_path_worker` y llama `set_clip_location(..., "pending_upload", final_path_worker=…)`. Tres endpoints (`list`, `mark_uploaded`, `location`) disponibles.
+
+**Pendiente:** ejecutar un job QA real end-to-end desde el VPS con `clip_id` + `campaign_id` en el payload para cerrar el bucle.
 
 ## Comandos y ubicaciones
 
