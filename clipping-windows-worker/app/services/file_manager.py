@@ -15,6 +15,22 @@ logger = get_logger("file_manager")
 # Tamaño de chunk para streaming (1 MB).
 _CHUNK_SIZE = 1024 * 1024
 
+# Hosts que requieren un extractor específico (yt-dlp).
+# YouTube no expone el MP4 vía GET directo: responde con la watch page HTML.
+_YT_DLP_HOSTS: tuple[str, ...] = (
+    "youtube.com",
+    "youtu.be",
+    "www.youtube.com",
+    "m.youtube.com",
+    "music.youtube.com",
+)
+
+
+def _needs_ytdlp(url: str) -> bool:
+    """True si la URL apunta a un host que necesita yt-dlp."""
+    lowered = url.lower()
+    return any(host in lowered for host in _YT_DLP_HOSTS)
+
 
 class FileManager:
     """Descarga archivos grandes por streaming y calcula su SHA256."""
@@ -29,14 +45,31 @@ class FileManager:
         *,
         timeout: float = 3600.0,
     ) -> Path:
-        """Descarga un archivo por streaming sin cargarlo en memoria.
+        """Descarga un archivo y devuelve la ruta local.
 
-        Devuelve la ruta del archivo descargado.
+        Enruta automáticamente:
+        - YouTube /youtu.be → ``yt_dlp.YoutubeDL`` (descarga el MP4/WebM real).
+        - Resto de URLs → ``httpx.stream`` (streaming directo).
+
+        Para YouTube, ``destination`` actúa como **plantilla**: si no tiene
+        ``%(ext)s`` se añade para que yt-dlp pueda estampar la extensión real.
         """
+        if _needs_ytdlp(url):
+            return self.download_with_ytdlp(url, destination)
+        return self.download_http(url, destination, timeout=timeout)
+
+    def download_http(
+        self,
+        url: str,
+        destination: str | Path,
+        *,
+        timeout: float = 3600.0,
+    ) -> Path:
+        """Descarga un archivo por streaming HTTP sin cargarlo en memoria."""
         dest = Path(destination)
         dest.parent.mkdir(parents=True, exist_ok=True)
 
-        logger.info("downloading file", url=url, destination=str(dest))
+        logger.info("downloading file (http)", url=url, destination=str(dest))
         with httpx.stream("GET", url, timeout=timeout, follow_redirects=True) as response:
             response.raise_for_status()
             with open(dest, "wb") as f:
@@ -45,6 +78,112 @@ class FileManager:
 
         logger.info("download complete", url=url, size=dest.stat().st_size)
         return dest
+
+    def download_with_ytdlp(
+        self,
+        url: str,
+        destination: str | Path,
+    ) -> Path:
+        """Descarga un vídeo usando ``yt-dlp`` (YouTube y similares).
+
+        ``destination`` puede ser un directorio (se usa un nombre derivado
+        del título) o una plantilla con ``%(ext)s``. Tras la descarga,
+        se devuelve la ruta final del fichero con su extensión real.
+
+        Si el destino pedido no existe tras la descarga, se busca el
+        archivo más reciente en el directorio padre y, si es único y
+        procede claramente de esta descarga, se renombra al destino.
+        """
+        # Importación local para que el resto del módulo no dependa de yt-dlp.
+        import yt_dlp
+
+        dest = Path(destination)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        search_dir = dest if dest.is_dir() else dest.parent
+
+        # Si es un directorio, yt-dlp lo trata como tal y nombra el archivo.
+        # Si es una ruta sin %(ext)s, se le añade para evitar .bin genérico.
+        out_template = str(dest)
+        if dest.is_dir() or "%(ext)s" not in out_template:
+            if dest.is_dir():
+                out_template = str(dest / "%(id)s.%(ext)s")
+            else:
+                # Sustituir la extensión (incluyendo .bin) por plantilla.
+                out_template = str(dest.with_suffix("")) + ".%(ext)s"
+
+        ydl_opts: dict = {
+            "outtmpl": out_template,
+            "quiet": True,
+            "no_warnings": True,
+            "noprogress": True,
+            "merge_output_format": "mp4",
+            "format": "bv*+ba/b",
+        }
+
+        logger.info("downloading file (yt-dlp)", url=url, template=out_template)
+
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=True)
+            if isinstance(info, dict) and "entries" in info and info["entries"]:
+                info = info["entries"][0]
+
+            # Camino 1: yt-dlp nos dice exactamente dónde quedó.
+            requested = info.get("requested_downloads") or []
+            candidate: Path | None = None
+            if requested:
+                candidate = Path(requested[0].get("filepath") or "")
+
+            # Camino 2: predecir por nombre, pero yt-dlp a veces cambia
+            # la extensión tras el merge (webm → mp4/mkv).
+            if candidate is None or not candidate.exists():
+                predicted = Path(ydl.prepare_filename(info))
+                if predicted.exists():
+                    candidate = predicted
+
+        # Camino 3: buscar el archivo más reciente en el directorio.
+        # Esto cubre el caso de merges que dejan el archivo en otro nombre.
+        if candidate is None or not candidate.exists():
+            files = sorted(
+                search_dir.glob("*"),
+                key=lambda p: p.stat().st_mtime,
+                reverse=True,
+            )
+            files = [f for f in files if f.is_file()]
+            if len(files) == 1:
+                candidate = files[0]
+            elif files:
+                # Tomar el más reciente que no sea .bin o .part si hay otros.
+                non_partial = [
+                    f for f in files
+                    if not f.suffix in (".part", ".ytdl")
+                ]
+                candidate = non_partial[0] if non_partial else files[0]
+
+        if candidate is None or not candidate.exists():
+            raise FileNotFoundError(
+                f"yt-dlp reported success but no file was found in {search_dir}"
+            )
+
+        final_path = candidate
+
+        # Si el destino solicitado es un archivo concreto que no existe y
+        # yt-dlp dejó otro nombre, renombrar para preservar el contrato.
+        if (
+            not dest.is_dir()
+            and dest != final_path
+            and not dest.exists()
+        ):
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            final_path.rename(dest)
+            final_path = dest
+
+        logger.info(
+            "download complete (yt-dlp)",
+            url=url,
+            path=str(final_path),
+            size=final_path.stat().st_size,
+        )
+        return final_path
 
     @staticmethod
     def sha256(path: str | Path) -> str:

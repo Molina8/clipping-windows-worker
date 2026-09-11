@@ -17,9 +17,12 @@ class RenderJob(BaseJob):
     def execute(self) -> dict[str, Any]:
         payload = self.job.payload
         input_video = payload.get("input_video")
-        start = float(payload.get("start", 0.0))
-        end = float(payload.get("end", 0.0))
-        output_format = payload.get("output_format", "9:16")
+        # Aceptamos tanto `start_time`/`end_time` (canónico) como `start`/`end`
+        # (legacy) por compatibilidad con jobs antiguos.
+        start = float(payload.get("start_time", payload.get("start", 0.0)))
+        end = float(payload.get("end_time", payload.get("end", 0.0)))
+        # Aceptamos tanto `format` (canónico VPS) como `output_format` (legacy)
+        output_format = payload.get("format") or payload.get("output_format", "9:16")
 
         if not input_video:
             raise ValueError("payload.input_video is required")
@@ -62,11 +65,22 @@ class RenderJob(BaseJob):
         )
 
         self.logger.info("clip rendered", output=str(output_path))
+        file_size = output_path.stat().st_size
+        # Duración real del clip generado (puede diferir ligeramente de
+        # end-start por el redondeo a keyframe). La usamos en el QA y
+        # la persistimos en VPS como `duration_seconds`.
+        duration_seconds = max(0.0, end - start)
         return {
+            # Canónico (VPS consume esto)
+            "file_path": str(output_path),
+            "file_size": file_size,
+            "duration_seconds": duration_seconds,
+            "format": output_format,
+            # Aliases para retro-compatibilidad con jobs antiguos
             "output_path": str(output_path),
             "filename": output_path.name,
-            "size": output_path.stat().st_size,
-            "format": output_format,
+            "size": file_size,
+            "output_format": output_format,
         }
 
     def _resolve_input(self, path: str) -> Path:

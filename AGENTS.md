@@ -189,6 +189,23 @@ La reclamación usa PostgreSQL con `FOR UPDATE SKIP LOCKED`, orden por prioridad
 
 > Render y QA ya están validados localmente; pendiente probarlos end-to-end desde el VPS.
 
+## Bug resuelto: download job descargaba HTML en lugar de vídeo
+
+**Causa raíz:** `DownloadJob` del Worker usaba `httpx.stream("GET", url)`. Para YouTube esto devuelve la `watch page` HTML (~1.26 MB), no el MP4/WebM real. El binario `yt-dlp` (WinGet) estaba disponible pero el código Python no lo invocaba. Los `download.bin` reales en disco eran todos `<!DOCTYPE html>...`.
+
+**Fix aplicado** (sin reinstalar nada del stack CUDA/WhisperX):
+- `yt-dlp>=2026.8.0` añadido a `requirements.txt` e instalado en `.venv` (versión `2026.08.19`).
+- `app/services/file_manager.py`: nuevo `download_with_ytdlp()` y enrutamiento por host en `FileManager.download()` (YouTube/yt-dlp, resto/httpx).
+- `app/jobs/download.py`: respeta el path real de yt-dlp (incluido el rename tras merge `webm → mp4`).
+
+**Verificación con la URL del bug (`be7dKHOK4NQ`):**
+- 365.97 MB descargados en 77.2 s (vs. 1.26 MB de HTML antes).
+- Magic bytes: `00 00 00 20 66 74 79 70 69 73 6F 6D` (`ftyp isom`) → MP4 real.
+- `ffprobe`: `format_name=mov,mp4,m4a,3gp,3g2,mj2`, `duration=749.014s`, vídeo `av1` + audio `opus`.
+- `ffmpeg -i ... -vn -ac 1 -ar 16000 -acodec pcm_s16le audio.wav` → 23.97 MB, sin error.
+
+Contrato del job `download` no cambia. Detalle completo en `HANDOFF — Clipping System - OpenClaw - Windows GPU Worker.md` §66.
+
 ## Decisiones técnicas tomadas
 
 - **`worker_id` esperado en el VPS:** `windows-gpu-worker-01` (es el ID que el Worker se auto-asigna según `.env`; verificar antes de crear jobs).

@@ -16,11 +16,12 @@ class QAJob(BaseJob):
 
     def execute(self) -> dict[str, Any]:
         payload = self.job.payload
-        video = payload.get("video")
+        # Aceptamos `file_path` (canónico VPS) y `video` (legacy)
+        video = payload.get("file_path") or payload.get("video")
         rules = payload.get("rules") or {}
 
         if not video:
-            raise ValueError("payload.video is required")
+            raise ValueError("payload.file_path is required")
 
         source = self._resolve_input(video)
         if not source.exists():

@@ -11,6 +11,10 @@ structlog>=24.1.0
 # Instalar con soporte CUDA: pip install whisperx
 whisperx>=3.8.0
 
+# Descarga de vídeos (YouTube y otras fuentes con httpx no es viable:
+# YouTube devuelve HTML en /watch y requiere extractor específico).
+yt-dlp>=2026.8.0
+
 # Tests
 pytest>=8.0.0
 pytest-asyncio>=0.23.0
