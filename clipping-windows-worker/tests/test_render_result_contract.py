@@ -98,6 +98,108 @@ def test_render_accepts_legacy_output_format_field(tmp_path):
     rj = RenderJob(settings=settings, job=job)
     result = rj.execute()
     assert result["format"] == "16:9"
+
+
+def _probe_fps(path: Path) -> float:
+    """Lee fps del stream de vídeo con ffprobe."""
+    out = subprocess.check_output(
+        [
+            "ffprobe", "-v", "error",
+            "-select_streams", "v:0",
+            "-show_entries", "stream=avg_frame_rate,r_frame_rate",
+            "-of", "default=nw=1",
+            str(path),
+        ],
+        text=True,
+    )
+    for line in out.splitlines():
+        if line.startswith("avg_frame_rate=") or line.startswith("r_frame_rate="):
+            num, _, den = line.split("=", 1)[1].partition("/")
+            num_f = float(num)
+            den_f = float(den) if den else 1.0
+            if den_f == 0:
+                continue
+            return num_f / den_f
+    raise AssertionError(f"could not parse fps from ffprobe output:\n{out}")
+
+
+def test_render_force_30fps_on_30fps_source(tmp_path):
+    """Fuente a 30 fps → salida 30 fps (±0.05)."""
+    settings = _make_settings(tmp_path)
+    src = _make_lavfi_source(tmp_path, "src_30.mp4", duration=4)
+
+    job = _make_job("render-fps-30", {
+        "input_video": str(src),
+        "format": "9:16",
+        "start_time": 0.0,
+        "end_time": 3.0,
+    })
+    rj = RenderJob(settings=settings, job=job)
+    result = rj.execute()
+
+    fps = _probe_fps(Path(result["file_path"]))
+    assert fps == pytest.approx(30.0, abs=0.5), (
+        f"fps esperado ~30, got {fps}. "
+        f"El render debe forzar el framerate de salida con -r 30."
+    )
+
+
+def test_render_force_30fps_on_23976_source(tmp_path):
+    """Fuente a 23.976 fps → salida 30 fps tras el -r 30 (no 23.976)."""
+    settings = _make_settings(tmp_path)
+    # Generamos fuente nativo a 23.976 (rate=24000/1001).
+    src_dir = tmp_path / "src_23976"
+    src_dir.mkdir(parents=True, exist_ok=True)
+    src = src_dir / "src.mp4"
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-f", "lavfi",
+            "-i", "testsrc=duration=5:size=1280x720:rate=24000/1001",
+            "-pix_fmt", "yuv420p", str(src),
+        ],
+        check=True, capture_output=True,
+    )
+
+    job = _make_job("render-fps-23976", {
+        "input_video": str(src),
+        "format": "16:9",
+        "start_time": 0.0,
+        "end_time": 3.0,
+    })
+    rj = RenderJob(settings=settings, job=job)
+    result = rj.execute()
+
+    # Sanity: el fuente SÍ es 23.976.
+    src_fps = _probe_fps(src)
+    assert 23.0 <= src_fps <= 24.5, f"fuente no es 23.976 (got {src_fps})"
+
+    out_fps = _probe_fps(Path(result["file_path"]))
+    assert out_fps == pytest.approx(30.0, abs=0.5), (
+        f"fps esperado ~30 sobre fuente 23.976, got {out_fps}. "
+        f"Bug: el render no fuerza -r 30 en el output."
+    )
+
+
+def test_render_payload_fps_override(tmp_path):
+    """El payload.fps debe sobrescribir el default de Settings."""
+    settings = _make_settings(tmp_path)
+    src = _make_lavfi_source(tmp_path, "src_override.mp4", duration=4)
+
+    job = _make_job("render-fps-override", {
+        "input_video": str(src),
+        "format": "16:9",
+        "start_time": 0.0,
+        "end_time": 3.0,
+        "fps": 60.0,
+    })
+    rj = RenderJob(settings=settings, job=job)
+    result = rj.execute()
+
+    fps = _probe_fps(Path(result["file_path"]))
+    assert fps == pytest.approx(60.0, abs=0.5), (
+        f"payload.fps=60 ignorado: got {fps}"
+    )
+    assert result["format"] == "16:9"
     assert result["output_format"] == "16:9"
 
 

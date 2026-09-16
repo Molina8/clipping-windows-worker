@@ -44,6 +44,16 @@ class RenderJob(BaseJob):
         if watermark.get("enabled") and watermark.get("file"):
             watermark = {**watermark, "file": str(self._resolve_input(watermark["file"]))}
 
+        # Framerate de salida. Por defecto 30 fps para evitar que fuentes
+        # nativos a 23.976/24/25/29.97 fallen la regla QA de ``min_fps``.
+        # El VPS puede sobrescribirlo vía ``payload.fps`` (o ``output_fps``).
+        output_fps = float(
+            payload.get("fps")
+            or payload.get("output_fps")
+            or self.settings.render_output_fps
+            or 30.0
+        )
+
         output_path = self.directory.output / "clip.mp4"
         ffmpeg = FFmpegTool(self.settings)
 
@@ -53,6 +63,7 @@ class RenderJob(BaseJob):
             start=start,
             end=end,
             format=output_format,
+            output_fps=output_fps,
         )
         ffmpeg.render_clip(
             input_path=source,
@@ -62,6 +73,7 @@ class RenderJob(BaseJob):
             output_format=output_format,
             captions_file=captions_file,
             watermark=watermark,
+            output_fps=output_fps,
         )
 
         self.logger.info("clip rendered", output=str(output_path))

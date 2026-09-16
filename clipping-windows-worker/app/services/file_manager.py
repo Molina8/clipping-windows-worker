@@ -8,6 +8,16 @@ from pathlib import Path
 import httpx
 
 from app.config import Settings
+from app.services.drive_resolver import (
+    DriveAssetNotFound,
+    DriveAuthRequired,
+    DriveDocNotVideo,
+    DriveResolverError,
+    is_drive_url,
+    resolve as resolve_drive_url,
+    try_with_confirm_token,
+)
+from app.tools.ffprobe import FFprobeTool
 from app.utils.logging import get_logger
 
 logger = get_logger("file_manager")
@@ -49,14 +59,68 @@ class FileManager:
 
         Enruta automáticamente:
         - YouTube /youtu.be → ``yt_dlp.YoutubeDL`` (descarga el MP4/WebM real).
+        - Google Drive / Google Docs → ``drive_resolver`` reescribe la URL
+          (view→uc, listado de carpetas, scraping de Docs) y aplica cookies
+          de sesión si están configuradas.
         - Resto de URLs → ``httpx.stream`` (streaming directo).
 
         Para YouTube, ``destination`` actúa como **plantilla**: si no tiene
         ``%(ext)s`` se añade para que yt-dlp pueda estampar la extensión real.
         """
+        cookies: dict[str, str] | None = None
+        if is_drive_url(url):
+            try:
+                resolved = resolve_drive_url(url)
+            except (DriveAuthRequired, DriveAssetNotFound, DriveDocNotVideo):
+                # Re-raise con mensaje accionable: los tipos ya son
+                # suficientemente explícitos para el operador.
+                raise
+            except DriveResolverError as exc:
+                raise ValueError(f"Drive resolver error: {exc}") from exc
+
+            logger.info(
+                "drive url resolved",
+                original=url,
+                resolved=resolved.url,
+                pattern=resolved.source_pattern,
+            )
+            url = resolved.url
+            cookies = resolved.cookies or None
+
+            # Si el resolver devolvió una URL de YouTube (Doc→YT), enrutar a yt-dlp.
+            if _needs_ytdlp(url):
+                path = self.download_with_ytdlp(url, destination)
+            else:
+                path = self.download_http(
+                    url, destination, timeout=timeout, cookies=cookies
+                )
+
+            # Si tras la descarga todavía es HTML (página de confirmación de
+            # virus scan), reintentar con confirm=t.
+            try:
+                self.validate_media_file(path, source_url=url, cookies=cookies)
+            except ValueError as exc:
+                if "HTML/XML page" not in str(exc):
+                    raise
+                recovered = self._retry_html_download(
+                    url=url,
+                    destination=destination,
+                    cookies=cookies,
+                    timeout=timeout,
+                )
+                if recovered is None:
+                    raise
+                path = recovered
+
+            return path
+
         if _needs_ytdlp(url):
-            return self.download_with_ytdlp(url, destination)
-        return self.download_http(url, destination, timeout=timeout)
+            path = self.download_with_ytdlp(url, destination)
+        else:
+            path = self.download_http(url, destination, timeout=timeout)
+
+        self.validate_media_file(path, source_url=url)
+        return path
 
     def download_http(
         self,
@@ -64,13 +128,20 @@ class FileManager:
         destination: str | Path,
         *,
         timeout: float = 3600.0,
+        cookies: dict[str, str] | None = None,
     ) -> Path:
         """Descarga un archivo por streaming HTTP sin cargarlo en memoria."""
         dest = Path(destination)
         dest.parent.mkdir(parents=True, exist_ok=True)
 
         logger.info("downloading file (http)", url=url, destination=str(dest))
-        with httpx.stream("GET", url, timeout=timeout, follow_redirects=True) as response:
+        with httpx.stream(
+            "GET",
+            url,
+            timeout=timeout,
+            follow_redirects=True,
+            cookies=cookies or None,
+        ) as response:
             response.raise_for_status()
             with open(dest, "wb") as f:
                 for chunk in response.iter_bytes(chunk_size=_CHUNK_SIZE):
@@ -184,6 +255,114 @@ class FileManager:
             size=final_path.stat().st_size,
         )
         return final_path
+
+    def validate_media_file(
+        self,
+        path: str | Path,
+        *,
+        source_url: str | None = None,
+        cookies: dict[str, str] | None = None,
+    ) -> None:
+        """Reject HTML/error pages saved as successful media downloads.
+
+        Si ``source_url`` y ``cookies`` están disponibles y la página es
+        la de "can't scan for viruses" de Drive, reintenta in-place con
+        ``confirm=t`` antes de marcar como fallo.
+        """
+        media_path = Path(path)
+        if not media_path.is_file() or media_path.stat().st_size == 0:
+            raise ValueError(f"Downloaded file is empty or missing: {media_path}")
+
+        with media_path.open("rb") as file:
+            prefix = file.read(512).lstrip().lower()
+
+        if prefix.startswith((b"<!doctype html", b"<html", b"<?xml")):
+            hint = (
+                " (Drive devolvió página de confirmación/virus scan; "
+                "asegúrate de que las cookies de sesión están configuradas)"
+                if source_url and "drive.google.com" in source_url
+                else ""
+            )
+            raise ValueError(
+                f"Downloaded URL returned an HTML/XML page instead of media: "
+                f"{media_path}{hint}"
+            )
+
+        try:
+            probe = FFprobeTool(self.settings).probe(media_path)
+        except Exception as exc:  # noqa: BLE001 - normalize tool errors at boundary
+            raise ValueError(
+                f"Downloaded file is not a readable media container: {media_path}"
+            ) from exc
+
+        streams = probe.get("streams", [])
+        if not any(stream.get("codec_type") in {"video", "audio"} for stream in streams):
+            raise ValueError(
+                f"Downloaded file contains no audio or video stream: {media_path}"
+            )
+
+    def _retry_html_download(
+        self,
+        *,
+        url: str,
+        destination: str | Path,
+        cookies: dict[str, str] | None,
+        timeout: float,
+    ) -> Path | None:
+        """Si la primera descarga cayó en una página de confirmación de Drive,
+        reintenta con ``confirm=t`` y reemplaza ``destination`` in-place.
+        Devuelve la nueva ``Path`` si tuvo éxito, o ``None`` si no se pudo.
+        """
+        # Volver a hacer GET a la URL original propagando cookies y leyendo
+        # el HTML, para luego extraer el token. (Más barato que re-parsear el
+        # .bin ya guardado.)
+        try:
+            with httpx.Client(
+                follow_redirects=True,
+                timeout=60.0,
+                cookies=cookies or None,
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/126.0.0.0 Safari/537.36"
+                    ),
+                },
+            ) as client:
+                probe_response = client.get(url)
+                retry_response = try_with_confirm_token(probe_response, cookies)
+        except httpx.HTTPError as exc:
+            logger.warning("drive confirm-retry http error", error=str(exc))
+            return None
+
+        if retry_response is None or retry_response.status_code != 200:
+            return None
+
+        # Verificar que esta vez sí es binario.
+        head = retry_response.content[:512].lstrip().lower()
+        if head.startswith((b"<!doctype html", b"<html", b"<?xml")):
+            logger.warning(
+                "drive confirm-retry still returned HTML; giving up",
+                url=url,
+            )
+            return None
+
+        dest = Path(destination)
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        with open(dest, "wb") as f:
+            f.write(retry_response.content)
+
+        logger.info(
+            "drive confirm-retry recovered download",
+            url=url,
+            size=dest.stat().st_size,
+        )
+
+        try:
+            self.validate_media_file(dest)
+        except ValueError:
+            return None
+        return dest
 
     @staticmethod
     def sha256(path: str | Path) -> str:

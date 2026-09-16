@@ -9,7 +9,7 @@ from app.config import Settings
 
 def test_default_settings(tmp_path: Path) -> None:
     settings = Settings(working_directory=str(tmp_path))
-    assert settings.worker_id == "windows-worker-01"
+    assert settings.worker_id == "windows-gpu-worker-01"
     assert settings.max_concurrent_jobs == 1
     assert settings.device == "cuda"
     assert settings.allow_cpu_fallback is False

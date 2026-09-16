@@ -106,3 +106,20 @@ def test_download_uses_job_id_in_filename(tmp_path):
         assert "?" not in Path(result["file_path"]).name
     finally:
         httpd.shutdown()
+
+
+def test_download_rejects_html_response(tmp_path):
+    settings = _make_settings(tmp_path)
+    asset_dir = tmp_path / "asset"
+    asset_dir.mkdir()
+    (asset_dir / "page.html").write_text(
+        "<!DOCTYPE html><html><title>Google Drive</title></html>",
+        encoding="utf-8",
+    )
+    httpd, base = _start_http_server(asset_dir)
+    try:
+        job = _make_job("dl-html-001", f"{base}/page.html")
+        with pytest.raises(ValueError, match="HTML/XML page instead of media"):
+            DownloadJob(settings=settings, job=job).execute()
+    finally:
+        httpd.shutdown()

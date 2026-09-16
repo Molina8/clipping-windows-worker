@@ -33,7 +33,7 @@ class Settings(BaseSettings):
     # Identidad
     # --------------------------------------------------------------
 
-    worker_id: str = "windows-worker-01"
+    worker_id: str = "windows-gpu-worker-01"
 
     # --------------------------------------------------------------
     # API central
@@ -84,6 +84,22 @@ class Settings(BaseSettings):
         description=(
             "Carpeta raíz del almacenamiento por campaña. El QA job "
             "copia los clips aprobados a <root>/<campaign_id>/pending_upload/."
+        ),
+    )
+
+    # --------------------------------------------------------------
+    # Render
+    # --------------------------------------------------------------
+
+    render_output_fps: float = Field(
+        default=30.0,
+        gt=0.0,
+        description=(
+            "Framerate de salida por defecto para el job ``render``. Se "
+            "aplica como ``-r`` después del filtergraph para evitar que "
+            "fuentes nativos a 23.976/24/25/29.97 fallen la regla QA de "
+            "``min_fps``. Sobrescribible vía ``payload.fps`` o "
+            "``payload.output_fps`` en cada job."
         ),
     )
 

@@ -75,10 +75,19 @@ class FFmpegTool:
         output_format: str = "9:16",
         captions_file: str | Path | None = None,
         watermark: dict[str, Any] | None = None,
+        output_fps: float = 30.0,
     ) -> Path:
         """Renderiza un clip: trim + crop/scale + subtítulos + watermark + encode.
 
-        `output_format` soporta "9:16" (1080x1920) y "16:9" (1920x1080).
+        ``output_format`` soporta "9:16" (1080x1920) y "16:9" (1920x1080).
+
+        ``output_fps`` fuerza el framerate de salida (default 30.0) para que el
+        QA no falle por fuentes nativos a 23.976/24/25/29.97. El ajuste se
+        aplica como ``-r`` **después** del filtergraph (encoder/muxer), no
+        como filtro ``fps=`` (eso duplicaría trabajo con ``scale``/``crop``).
+        Para clips cortos de 30-60s este cambio sólo reescribe timestamps;
+        si en el futuro hace falta interpolación real de frames, mover a
+        ``fps=30:round=near`` dentro del filtergraph.
         """
         output = Path(output_path)
         duration = max(0.0, end - start)
@@ -148,6 +157,13 @@ class FFmpegTool:
             # Sin watermark: simple filtergraph con -vf (1 entrada / 1 salida).
             command += ["-vf", ",".join(vf_parts)]
 
+        # Forzar framerate de salida. Se coloca DESPUÉS del filtergraph
+        # para que se aplique al stream codificado (no al input). Esto
+        # evita que clips con fuente 23.976/24/25/29.97 fallen la regla
+        # QA de ``min_fps >= 24`` por margen de milésimas.
+        if output_fps and output_fps > 0:
+            command += ["-r", f"{output_fps:.3f}"]
+
         command += [
             "-c:v",
             "libx264",
@@ -174,6 +190,7 @@ class FFmpegTool:
             end=end,
             format=output_format,
             watermark=has_watermark,
+            output_fps=output_fps,
         )
         run_command(command, timeout=3600, cwd=vfilter_cwd)
         return output
