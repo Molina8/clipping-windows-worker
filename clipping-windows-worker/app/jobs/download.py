@@ -1,8 +1,4 @@
-"""Job de descarga.
-
-Drive grande / Shared Drive → `gog drive download` (OAuth).
-HTTP anónimo solo para URLs que no son Drive.
-"""
+"""Job de descarga. Drive → gog; resto HTTP/yt-dlp."""
 from __future__ import annotations
 
 import os
@@ -18,14 +14,8 @@ from app.services.file_manager import FileManager, _needs_ytdlp
 from app.tools.ffprobe import FFprobeTool
 
 _KIND_TO_EXT = {
-    "mp4": ".mp4",
-    "mov": ".mov",
-    "mkv": ".mkv",
-    "webm": ".webm",
-    "avi": ".avi",
-    "m4v": ".m4v",
-    "video": ".mp4",
-    "footage": ".mp4",
+    "mp4": ".mp4", "mov": ".mov", "mkv": ".mkv", "webm": ".webm",
+    "avi": ".avi", "m4v": ".m4v", "video": ".mp4", "footage": ".mp4",
 }
 _FILE_ID_RE = re.compile(r"/file/d/([A-Za-z0-9_-]+)")
 
@@ -43,34 +33,45 @@ def _drive_file_id(url: str) -> str | None:
     return (qs.get("id") or [None])[0]
 
 
-def _gog_bin() -> str:
-    return os.environ.get("GOG_PATH") or shutil.which("gog") or shutil.which("gog.exe") or ""
+def _gog_bin(settings) -> str:
+    for candidate in (
+        getattr(settings, "gog_path", None),
+        os.environ.get("GOG_PATH"),
+        shutil.which("gog"),
+        shutil.which("gog.exe"),
+    ):
+        if not candidate:
+            continue
+        p = Path(str(candidate))
+        if p.is_file():
+            return str(p)
+        found = shutil.which(str(candidate))
+        if found:
+            return found
+    return ""
 
 
-def _gog_download(file_id: str, dest: Path, logger) -> Path:
-    binary = _gog_bin()
+def _gog_download(file_id: str, dest: Path, logger, settings) -> Path:
+    binary = _gog_bin(settings)
     if not binary:
         raise RuntimeError(
-            "gog not found. Install gogcli on the Worker and set GOG_PATH or PATH. "
-            "Anonymous Drive HTTP cannot fetch large Shared Drive files."
+            "gog not found. Set gog_path=C:\\path\\gog.exe in the Worker .env and restart."
         )
     dest.parent.mkdir(parents=True, exist_ok=True)
+    account = os.environ.get("GOG_ACCOUNT") or getattr(settings, "gog_account", None)
     cmd = [binary, "drive", "download", file_id, "--out", str(dest), "--overwrite"]
-    account = os.environ.get("GOG_ACCOUNT")
     if account:
-        cmd[1:1] = []  # keep drive as subcommand
         cmd = [binary, "--account", account, "drive", "download", file_id, "--out", str(dest), "--overwrite"]
     env = dict(os.environ)
-    logger.info("gog drive download", file_id=file_id, dest=str(dest))
+    pw = os.environ.get("GOG_KEYRING_PASSWORD") or getattr(settings, "gog_keyring_password", None)
+    if pw:
+        env["GOG_KEYRING_PASSWORD"] = pw
+    logger.info("gog drive download", file_id=file_id, bin=binary, dest=str(dest))
     p = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=1800)
     if p.returncode != 0:
-        raise RuntimeError(
-            f"gog download failed ({p.returncode}): {(p.stderr or p.stdout or '')[:500]}"
-        )
+        raise RuntimeError(f"gog download failed ({p.returncode}): {(p.stderr or p.stdout or '')[:500]}")
     if not dest.exists() or dest.stat().st_size < 10_000:
-        raise RuntimeError(
-            f"gog download produced no media at {dest} size={dest.stat().st_size if dest.exists() else 0}"
-        )
+        raise RuntimeError(f"gog produced no media at {dest}")
     return dest
 
 
@@ -82,18 +83,14 @@ class DownloadJob(BaseJob):
         url = payload.get("url")
         if not url:
             raise ValueError("payload.url is required")
-
         file_manager = FileManager(self.settings)
         drive_id = _drive_file_id(url) or payload.get("source_id") or payload.get("file_id")
-
         if drive_id and not _needs_ytdlp(url):
-            tmp = self.directory.input / f"{self.job.id}.bin"
-            path = _gog_download(str(drive_id), tmp, self.logger)
+            path = _gog_download(str(drive_id), self.directory.input / f"{self.job.id}.bin", self.logger, self.settings)
         elif _needs_ytdlp(url):
             path = file_manager.download(url, self.directory.input)
         else:
             path = file_manager.download(url, self.directory.input / f"{self.job.id}.bin")
-
         stable = self._persist(path, payload)
         size = file_manager.file_size(stable)
         sha256 = file_manager.sha256(stable)
@@ -101,18 +98,10 @@ class DownloadJob(BaseJob):
         try:
             duration = FFprobeTool(self.settings).get_duration(stable)
         except Exception as exc:  # noqa: BLE001
-            self.logger.warning("ffprobe duration failed", path=str(stable), error=str(exc))
-
-        result = {
-            "file_path": str(stable),
-            "file_size": size,
-            "filename": stable.name,
-            "size": size,
-            "sha256": sha256,
-        }
+            self.logger.warning("ffprobe duration failed", error=str(exc))
+        result = {"file_path": str(stable), "file_size": size, "filename": stable.name, "size": size, "sha256": sha256}
         if duration is not None:
             result["duration_seconds"] = duration
-        self.logger.info("download verified", **{k: result[k] for k in ("file_path", "file_size")})
         return result
 
     def _persist(self, src: Path, payload: dict[str, Any]) -> Path:
@@ -122,8 +111,7 @@ class DownloadJob(BaseJob):
         name = str(payload.get("filename") or "")
         ext = Path(name).suffix.lower() if name else ""
         if ext not in {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"}:
-            kind = str(payload.get("kind") or "").lower().lstrip(".")
-            ext = _KIND_TO_EXT.get(kind, src.suffix or ".bin")
+            ext = _KIND_TO_EXT.get(str(payload.get("kind") or "").lower().lstrip("."), src.suffix or ".bin")
         dest = dest_dir / f"source{ext}"
         if src.resolve() != dest.resolve():
             shutil.copy2(src, dest)
