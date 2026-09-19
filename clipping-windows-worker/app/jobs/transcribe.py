@@ -8,6 +8,7 @@ from typing import Any
 
 from app.jobs.base import BaseJob
 from app.tools.ffmpeg import FFmpegTool
+from app.tools.ffprobe import FFprobeTool
 from app.tools.whisperx import WhisperXTool
 
 
@@ -31,6 +32,24 @@ class TranscribeJob(BaseJob):
         source = self._resolve_input(video_path)
         if not source.exists():
             raise FileNotFoundError(f"Input video not found: {source}")
+
+        # Validar que el input tiene pista de audio ANTES de extraer.
+        # Si no la tiene, ffmpeg.extract_audio falla con un mensaje críptico
+        # ("Output file does not contain any stream") que no deja claro
+        # al VPS la causa real. Mejor fallar pronto con un error accionable.
+        ffprobe = FFprobeTool(self.settings)
+        audio_stream = ffprobe.get_audio_stream(source)
+        if audio_stream is None:
+            video_stream = ffprobe.get_video_stream(source)
+            video_codec = video_stream.get("codec_name") if video_stream else None
+            duration = ffprobe.get_duration(source)
+            duration_str = f"{duration:.2f}s" if duration is not None else "unknown"
+            raise ValueError(
+                f"Input has no audio stream "
+                f"(video_codec={video_codec}, duration={duration_str}); "
+                "transcription requires an audio track. "
+                "Re-export the source with audio or skip this asset."
+            )
 
         self.logger.info("extracting audio", video=str(source))
         ffmpeg = FFmpegTool(self.settings)

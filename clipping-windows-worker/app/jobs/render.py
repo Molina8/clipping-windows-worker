@@ -16,7 +16,9 @@ class RenderJob(BaseJob):
 
     def execute(self) -> dict[str, Any]:
         payload = self.job.payload
-        input_video = payload.get("input_video")
+        # Aceptar `input_video` (canónico Worker) o `video` (contrato VPS / OpenClaw).
+        # Priorizar `input_video` si llega.
+        input_video = payload.get("input_video") or payload.get("video")
         # Aceptamos tanto `start_time`/`end_time` (canónico) como `start`/`end`
         # (legacy) por compatibilidad con jobs antiguos.
         start = float(payload.get("start_time", payload.get("start", 0.0)))
@@ -25,7 +27,7 @@ class RenderJob(BaseJob):
         output_format = payload.get("format") or payload.get("output_format", "9:16")
 
         if not input_video:
-            raise ValueError("payload.input_video is required")
+            raise ValueError("payload.input_video or payload.video is required")
         if end <= start:
             raise ValueError(f"end ({end}) must be greater than start ({start})")
 
@@ -54,7 +56,12 @@ class RenderJob(BaseJob):
             or 30.0
         )
 
-        output_path = self.directory.output / "clip.mp4"
+        # Nombre del clip: usar `candidate_id` si el VPS lo manda (para que
+        # el QA luego pueda moverlo a `<clip_storage_root>/<campaign_id>/pending_upload/<candidate_id>.mp4`
+        # sin renombrar). Fallback a `clip.mp4` por compatibilidad legacy.
+        candidate_id = payload.get("candidate_id")
+        clip_filename = f"{candidate_id}.mp4" if candidate_id else "clip.mp4"
+        output_path = self.directory.output / clip_filename
         ffmpeg = FFmpegTool(self.settings)
 
         self.logger.info(

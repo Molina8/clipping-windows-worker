@@ -343,6 +343,114 @@ Acepta también `"video_path"` por retrocompatibilidad. `result.data`:
 - **Validación local Worker:** `python test_qa_local.py {legacy|step18|fail-no-copy|all}`. `step18` valida copia correcta, `final_path_worker` apunta al archivo, `source_moved=true`, `source_intact=true`. `legacy` valida compat sin `clip_id`. `fail-no-copy` valida que QA FAIL no copia.
 - **Regresión:** `pytest tests/` → 27/27 PASS tras el cambio.
 
+## Validación de audio antes de transcribir (2026-09-18)
+
+**Causa raíz de los fallos en cascada:** muchos vídeos descargados desde Drive son **vídeo mudo** (sólo HEVC, sin pista de audio). `TranscribeJob` llamaba directamente a `ffmpeg.extract_audio()`, que ejecuta `-vn -acodec pcm_s16le -ar 16000 -ac 1`. Sin audio, FFmpeg responde:
+
+```
+Output file does not contain any stream
+Error opening output file ...\audio.wav.
+Error opening output files: Invalid argument
+```
+
+Este mensaje críptico no dice al VPS qué pasa realmente. Resultado: cascada de errores sin acción posible.
+
+**Fix aplicado** en [transcribe.py](clipping-windows-worker/app/jobs/transcribe.py):
+
+- Antes de `extract_audio()`, valida con `FFprobeTool.get_audio_stream()`.
+- Si no hay stream de audio, lanza `ValueError` con mensaje accionable:
+  `(video_codec=hevc, duration=34.27s); transcription requires an audio track. Re-export the source with audio or skip this asset.`
+- También evita el trabajo inútil de lanzar FFmpeg cuando sabemos que va a fallar.
+
+**Decisión:** fallar rápido con error claro (no generar audio sintético silencioso, no degradar silenciosamente). El VPS decide qué hacer: re-exportar la fuente, descartarla o marcarla como "vídeo decorativo".
+
+**Tests añadidos** en [test_transcribe_no_audio.py](clipping-windows-worker/tests/test_transcribe_no_audio.py) (3/3 PASS):
+
+- Input sin audio → `ValueError` con `no audio stream` + `video_codec=` + sugerencia accionable.
+- Input sin audio → NO se llama a `ffmpeg.extract_audio` (verificado con mock).
+- Input con audio → entra a la fase de extracción.
+
+**Regresión:** `pytest tests/` → 65/65 PASS (3 nuevos + 62 anteriores). Los 2 fallos residuales que aparecen (`test_drive_resolver.py::test_resolve_doc_extracts_direct_mp4` y `test_drive_download_integration.py::test_download_recovers_from_virus_scan_page`) son **preexistentes** y ajenos a este cambio — ya fallaban en `git stash` antes del fix.
+
+## Convención `.bin` en downloads HTTP (validado 2026-09-18)
+
+**Observación del VPS:** todos los jobs `download` por HTTP genérico (incluido Drive) producen archivos `*.bin` en disco en lugar de `*.mp4`. El VPS preguntó si esto era un bug.
+
+**Respuesta:** es **por diseño y correcto**, no es un bug. Ver [`download.py:36-48`](clipping-windows-worker/app/jobs/download.py#L36-L48):
+
+```python
+# - HTTP genérico → ``<job.id>.bin`` (job_id ya saneado por
+#   ``sanitize_job_id``; ``.bin`` porque la extensión real solo se
+#   conoce tras sniffing y no aporta valor: ``ffprobe``/``transcribe``
+#   funcionan igualmente sobre ``.bin``).
+filename = f"{self.job.id}.bin"
+destination = self.directory.input / filename
+```
+
+**Razones documentadas:**
+
+1. **No se conoce la extensión real hasta después de descargar.** El header HTTP `Content-Disposition` o el path de la URL muchas veces mienten o faltan (Drive ni siquiera manda `Content-Disposition` fiable).
+2. **El `job_id` ya es seguro** — UUID saneado por `sanitize_job_id`, no trae `?&=:/` ni caracteres que rompan `MAX_PATH` en Windows.
+3. **`ffprobe` y WhisperX no miran la extensión** — abren por magic bytes. Probado: el job `a766f7bc` consumió `c9836360-…bin` con magic `ftyp isom` y produjo `audio.wav` válido de 30.53 s sin tocar la extensión.
+4. **Es retro-compatible y testeable** — `test_download_http_e2e.py` y `test_download_youtube_branch.py` asumen `<job_id>.bin` para HTTP.
+
+**Cuándo NO es `.bin`:** solo YouTube (`_needs_ytdlp(url)`) → yt-dlp produce `<video_id>.mp4` real tras el merge `webm → mp4`.
+
+**Si en el futuro se quiere `.mp4` en disco:** hay que añadir post-sniffing con `ffprobe` + rename. Hoy no es prioritario porque el pipeline funciona.
+
+## Transcripción "corta" no es bug de WhisperX (validado 2026-09-18)
+
+**Observación del VPS:** el job `a766f7bc` produjo un `transcript.json` con **1 solo segmento "Weather!"** en `[0.07-0.79s]` cuando el audio fuente dura 30.53 s. Parecía bug del Worker o de WhisperX.
+
+**Diagnóstico realizado:**
+
+- `audio.wav` válido: 30.53 s, 16 kHz mono, RMS=0.17 (audio con energía).
+- Espectro: 62.7% en banda 200-4000 Hz (banda de habla típica).
+- Probado con WhisperX `large-v3` + `float16` + `cuda` variando idioma y VAD:
+
+| Config | Idioma detectado | Segmentos | Tiempo |
+|---|---|---|---|
+| `es` + sin VAD | `es` | **1** | 0.9 s |
+| `auto` + sin VAD | `en` | **1** | 1.0 s |
+| `en` + sin VAD | `en` | **1** | 0.3 s |
+| `en` + VAD default | `en` | **1** | 0.2 s |
+
+- Tiempo bajísimo (0.2-1.0 s para 30 s) → el modelo descarta la mayor parte como `no_speech_prob > 0.5`.
+
+**Conclusión validada con el usuario:** el vídeo fuente solo dice "Weather!" al principio y el resto es música/efectos/silencio. WhisperX **se está comportando correctamente** al descartar lo no-habla. No es bug del Worker, no es bug del modelo.
+
+**Aprendizaje para futuros casos parecidos:** si un asset produce transcripción "sospechosamente corta", **antes de tocar el Worker** hay que:
+
+1. Escuchar el audio (`start <ruta>\temp\audio.wav`).
+2. Confirmar si realmente contiene habla continua.
+3. Si sí contiene habla → investigar `compute_type`, `batch_size`, modelo.
+4. Si no contiene habla → el comportamiento actual es correcto; el VPS debe descartar el asset o registrar la métrica.
+
+## Render: aceptar alias `video` del VPS (fix 2026-09-18)
+
+**Bug observado en producción:** el VPS envía `payload.video` (path al `.bin`), pero [render.py](clipping-windows-worker/app/jobs/render.py) sólo leía `payload.input_video`. Resultado: `ValueError: payload.input_video is required`.
+
+**Causa raíz:** inconsistencia de contrato entre el job `transcribe` (que ya aceptaba `video`/`video_path`) y el job `render` (sólo `input_video`). El VPS usa `video` para todos los jobs.
+
+**Fix aplicado** en [render.py:21](clipping-windows-worker/app/jobs/render.py#L21):
+
+```python
+input_video = payload.get("input_video") or payload.get("video")
+```
+
+Mismo patrón que ya tenía `transcribe.py`. Mensaje de error actualizado a `"payload.input_video or payload.video is required"`.
+
+**Bonus: `candidate_id` como nombre de archivo.** Si el VPS manda `candidate_id` en el payload (lo hace), el clip se guarda como `<candidate_id>.mp4` en lugar de `clip.mp4` fijo. Esto permite que el QA posterior (`QAJob`) lo mueva a `<clip_storage_root>/<campaign_id>/pending_upload/<candidate_id>.mp4` sin renombrar y que el path de `final_path_worker` coincida 1:1 con el `clip_id` que el VPS persiste.
+
+**Test añadido** `test_render_accepts_vps_payload_with_video_field` en [test_render_result_contract.py](clipping-windows-worker/tests/test_render_result_contract.py): reproduce el payload literal del VPS (`video`, `start_time`, `end_time`, `format`, `candidate_id`, `campaign_id`) y valida:
+
+- No lanza `ValueError`.
+- `file_path` existe.
+- `duration_seconds ≈ 50.88 - 14.47`.
+- `filename == "<candidate_id>.mp4"` (alineado con `clip_id` que el QA espera).
+
+**Regresión:** `pytest tests/test_render_result_contract.py` → 7/7 PASS. Suite completa → 63/65 PASS (mismos 2 fallos preexistentes).
+
 ## División de trabajo actual
 
 - **OpenClaw/VPS:** Campaign Ingestor, Document Parser, Asset Resolver, Campaign Engine, `CampaignSpec`, auditor LLM, creación de jobs y persistencia de resultados.
