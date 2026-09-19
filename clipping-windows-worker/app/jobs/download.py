@@ -1,11 +1,7 @@
 """Job de descarga de archivos.
 
-Soporta dos modos:
-- HTTP(S) genérico → descarga con ``httpx.stream``.
-- YouTube / youtu.be → yt-dlp.
-
-Tras descargar, el fichero se copia a ``data/downloads/{asset_id}/``.
-El directorio del job es temporal; WhisperX tiene que leer una ruta estable.
+Tras descargar, el fichero se copia a ``data/downloads/{asset_id}/``
+y se reporta duración real con ffprobe.
 """
 
 from __future__ import annotations
@@ -16,6 +12,7 @@ from typing import Any
 
 from app.jobs.base import BaseJob
 from app.services.file_manager import FileManager, _needs_ytdlp
+from app.tools.ffprobe import FFprobeTool
 
 _KIND_TO_EXT = {
     "mp4": ".mp4",
@@ -30,14 +27,11 @@ _KIND_TO_EXT = {
 
 
 class DownloadJob(BaseJob):
-    """Descarga un archivo remoto al directorio del job y lo persiste."""
-
     type = "download"
 
     def execute(self) -> dict[str, Any]:
         payload = self.job.payload
         url = payload.get("url")
-
         if not url:
             raise ValueError("payload.url is required")
 
@@ -52,27 +46,35 @@ class DownloadJob(BaseJob):
             filename_for_log = filename
 
         self.logger.info("downloading input", url=url, filename=filename_for_log)
-
         path = file_manager.download(url, destination)
-
         stable = self._persist(path, payload)
         size = file_manager.file_size(stable)
         sha256 = file_manager.sha256(stable)
+
+        duration = None
+        try:
+            duration = FFprobeTool(self.settings).get_duration(stable)
+        except Exception as exc:  # noqa: BLE001
+            self.logger.warning("ffprobe duration failed", path=str(stable), error=str(exc))
 
         self.logger.info(
             "download verified",
             path=str(stable),
             filename=stable.name,
             size=size,
+            duration_seconds=duration,
             sha256=sha256[:16],
         )
-        return {
+        result = {
             "file_path": str(stable),
             "file_size": size,
             "filename": stable.name,
             "size": size,
             "sha256": sha256,
         }
+        if duration is not None:
+            result["duration_seconds"] = duration
+        return result
 
     def _persist(self, src: Path, payload: dict[str, Any]) -> Path:
         asset_id = str(payload.get("asset_id") or self.job.id)
