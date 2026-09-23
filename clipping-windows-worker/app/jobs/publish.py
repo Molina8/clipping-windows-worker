@@ -1,8 +1,4 @@
-"""Publish job — milestone 1 YouTube.
-
-Dry-run: no YouTube API. Still moves pending_upload -> uploaded.
-Live upload is step 4.
-"""
+"""Publish job — milestone 1 YouTube."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -22,32 +18,49 @@ class PublishJob(BaseJob):
         clip_id = payload.get("clip_id")
         campaign_id = payload.get("campaign_id")
         file_path = payload.get("file_path")
+        title = payload.get("title") or payload.get("caption") or f"clip-{clip_id}"
+        caption = payload.get("caption") or title
         if not clip_id:
             raise ValueError("payload.clip_id is required")
         if campaign_id is None:
             raise ValueError("payload.campaign_id is required")
-        if not dry_run:
-            raise NotImplementedError(
-                "live YouTube upload is step 4; rerun tick without --live"
-            )
+        if platform != "youtube":
+            raise NotImplementedError(f"platform {platform} not in milestone 1")
 
         dest = self._move_to_uploaded(clip_id=str(clip_id), campaign_id=campaign_id, file_path=file_path)
-        fake = f"https://youtube.com/shorts/dry-run-{clip_id}"
-        self.logger.info(
-            "publish dry-run moved to uploaded",
-            clip_id=clip_id,
-            platform=platform,
-            dest=str(dest),
+
+        if dry_run:
+            fake = f"https://youtube.com/shorts/dry-run-{clip_id}"
+            self.logger.info("publish dry-run", clip_id=clip_id, dest=str(dest))
+            return {
+                "dry_run": True,
+                "source_moved": True,
+                "final_path_worker": str(dest),
+                "publications": [{"platform": platform, "status": "posted", "post_url": fake}],
+            }
+
+        from app.services.youtube_upload import upload_short
+
+        uploaded = upload_short(
+            file_path=dest,
+            title=str(title),
+            description=str(caption),
+            client_id=getattr(self.settings, "youtube_client_id", None) or "",
+            client_secret=getattr(self.settings, "youtube_client_secret", None) or "",
+            refresh_token=getattr(self.settings, "youtube_refresh_token", None) or "",
+            privacy=getattr(self.settings, "youtube_privacy", None) or "public",
         )
+        self.logger.info("youtube uploaded", clip_id=clip_id, video_id=uploaded.get("video_id"))
         return {
-            "dry_run": True,
+            "dry_run": False,
             "source_moved": True,
             "final_path_worker": str(dest),
             "publications": [
                 {
                     "platform": platform,
                     "status": "posted",
-                    "post_url": fake,
+                    "post_url": uploaded["post_url"],
+                    "video_id": uploaded["video_id"],
                 }
             ],
         }
