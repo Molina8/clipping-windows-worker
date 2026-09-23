@@ -7,6 +7,7 @@ from pathlib import Path
 import httpx
 
 OPEN = "https://open.tiktokapis.com"
+DONE = {"PUBLISH_COMPLETE", "FAILED", "SEND_TO_USER_INBOX"}
 
 
 def upload_video(
@@ -64,7 +65,7 @@ def upload_video(
 
         status = ""
         payload: dict = {}
-        for _ in range(40):
+        for _ in range(90):
             st = client.post(
                 f"{OPEN}/v2/post/publish/status/fetch/",
                 headers=headers,
@@ -72,12 +73,21 @@ def upload_video(
             )
             payload = st.json() if st.content else {}
             status = ((payload.get("data") or {}).get("status") or "").upper()
-            if status in {"PUBLISH_COMPLETE", "FAILED", "SEND_TO_USER_INBOX"}:
+            if status in DONE:
                 break
-            time.sleep(3)
+            time.sleep(5)
         if status == "FAILED":
             raise RuntimeError(f"tiktok publish failed: {payload}")
-        if status not in {"PUBLISH_COMPLETE", "SEND_TO_USER_INBOX"}:
+        if status not in DONE:
+            uploaded = (payload.get("data") or {}).get("uploaded_bytes")
+            if uploaded == size or status in {"PROCESSING_UPLOAD", "PROCESSING_DOWNLOAD"}:
+                return {
+                    "publish_id": publish_id,
+                    "status": status or "PROCESSING_UPLOAD",
+                    "privacy_level": privacy_level,
+                    "title": title,
+                    "post_url": "https://www.tiktok.com/@clipeand22",
+                }
             raise TimeoutError(f"tiktok status={status} publish_id={publish_id} {payload}")
 
     return {
@@ -85,5 +95,5 @@ def upload_video(
         "status": status,
         "privacy_level": privacy_level,
         "title": title,
-        "post_url": f"https://www.tiktok.com/@clipeand22",
+        "post_url": "https://www.tiktok.com/@clipeand22",
     }
