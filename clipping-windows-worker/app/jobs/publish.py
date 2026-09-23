@@ -1,4 +1,4 @@
-"""Publish job — milestone 1 YouTube."""
+"""Publish job — YouTube Shorts + Instagram Reels."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -14,7 +14,7 @@ class PublishJob(BaseJob):
     def execute(self) -> dict[str, Any]:
         payload = self.job.payload if isinstance(self.job.payload, dict) else {}
         dry_run = payload.get("dry_run", True)
-        platform = payload.get("platform") or "youtube"
+        platform = (payload.get("platform") or "youtube").lower()
         clip_id = payload.get("clip_id")
         campaign_id = payload.get("campaign_id")
         file_path = payload.get("file_path")
@@ -24,14 +24,14 @@ class PublishJob(BaseJob):
             raise ValueError("payload.clip_id is required")
         if campaign_id is None:
             raise ValueError("payload.campaign_id is required")
-        if platform != "youtube":
-            raise NotImplementedError(f"platform {platform} not in milestone 1")
+        if platform not in {"youtube", "instagram"}:
+            raise NotImplementedError(f"platform {platform} not implemented")
 
         dest = self._move_to_uploaded(clip_id=str(clip_id), campaign_id=campaign_id, file_path=file_path)
 
         if dry_run:
-            fake = f"https://youtube.com/shorts/dry-run-{clip_id}"
-            self.logger.info("publish dry-run", clip_id=clip_id, dest=str(dest))
+            fake = f"https://{platform}.example/dry-run-{clip_id}"
+            self.logger.info("publish dry-run", clip_id=clip_id, platform=platform, dest=str(dest))
             return {
                 "dry_run": True,
                 "source_moved": True,
@@ -39,30 +39,40 @@ class PublishJob(BaseJob):
                 "publications": [{"platform": platform, "status": "posted", "post_url": fake}],
             }
 
-        from app.services.youtube_upload import upload_short
+        if platform == "youtube":
+            from app.services.youtube_upload import upload_short
 
-        uploaded = upload_short(
-            file_path=dest,
-            title=str(title),
-            description=str(caption),
-            client_id=getattr(self.settings, "youtube_client_id", None) or "",
-            client_secret=getattr(self.settings, "youtube_client_secret", None) or "",
-            refresh_token=getattr(self.settings, "youtube_refresh_token", None) or "",
-            privacy=getattr(self.settings, "youtube_privacy", None) or "public",
-        )
-        self.logger.info("youtube uploaded", clip_id=clip_id, video_id=uploaded.get("video_id"))
+            uploaded = upload_short(
+                file_path=dest,
+                title=str(title),
+                description=str(caption),
+                client_id=getattr(self.settings, "youtube_client_id", None) or "",
+                client_secret=getattr(self.settings, "youtube_client_secret", None) or "",
+                refresh_token=getattr(self.settings, "youtube_refresh_token", None) or "",
+                privacy=getattr(self.settings, "youtube_privacy", None) or "public",
+            )
+            post_url = uploaded["post_url"]
+            extra = {"video_id": uploaded.get("video_id")}
+        else:
+            from app.services.instagram_upload import upload_reel
+
+            uploaded = upload_reel(
+                file_path=dest,
+                caption=str(caption),
+                access_token=getattr(self.settings, "instagram_access_token", None) or "",
+                ig_user_id=getattr(self.settings, "instagram_ig_user_id", None) or "",
+            )
+            post_url = uploaded["post_url"]
+            extra = {"media_id": uploaded.get("media_id")}
+
+        self.logger.info("published", clip_id=clip_id, platform=platform)
+        pub = {"platform": platform, "status": "posted", "post_url": post_url}
+        pub.update(extra)
         return {
             "dry_run": False,
             "source_moved": True,
             "final_path_worker": str(dest),
-            "publications": [
-                {
-                    "platform": platform,
-                    "status": "posted",
-                    "post_url": uploaded["post_url"],
-                    "video_id": uploaded["video_id"],
-                }
-            ],
+            "publications": [pub],
         }
 
     def _move_to_uploaded(
