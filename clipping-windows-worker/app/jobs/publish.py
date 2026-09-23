@@ -1,4 +1,4 @@
-"""Publish job — YouTube Shorts + Instagram Reels."""
+"""Publish job — YouTube, Instagram, TikTok."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -24,7 +24,7 @@ class PublishJob(BaseJob):
             raise ValueError("payload.clip_id is required")
         if campaign_id is None:
             raise ValueError("payload.campaign_id is required")
-        if platform not in {"youtube", "instagram"}:
+        if platform not in {"youtube", "instagram", "tiktok"}:
             raise NotImplementedError(f"platform {platform} not implemented")
 
         dest = self._move_to_uploaded(clip_id=str(clip_id), campaign_id=campaign_id, file_path=file_path)
@@ -39,6 +39,7 @@ class PublishJob(BaseJob):
                 "publications": [{"platform": platform, "status": "posted", "post_url": fake}],
             }
 
+        extra: dict[str, Any] = {}
         if platform == "youtube":
             from app.services.youtube_upload import upload_short
 
@@ -53,7 +54,7 @@ class PublishJob(BaseJob):
             )
             post_url = uploaded["post_url"]
             extra = {"video_id": uploaded.get("video_id")}
-        else:
+        elif platform == "instagram":
             from app.services.instagram_upload import upload_reel
 
             uploaded = upload_reel(
@@ -64,6 +65,17 @@ class PublishJob(BaseJob):
             )
             post_url = uploaded["post_url"]
             extra = {"media_id": uploaded.get("media_id")}
+        else:
+            from app.services.tiktok_upload import upload_video
+
+            uploaded = upload_video(
+                file_path=dest,
+                title=str(title)[:150],
+                access_token=getattr(self.settings, "tiktok_access_token", None) or "",
+                privacy_level=getattr(self.settings, "tiktok_privacy", None) or "SELF_ONLY",
+            )
+            post_url = uploaded["post_url"]
+            extra = {"publish_id": uploaded.get("publish_id"), "privacy_level": uploaded.get("privacy_level")}
 
         self.logger.info("published", clip_id=clip_id, platform=platform)
         pub = {"platform": platform, "status": "posted", "post_url": post_url}
