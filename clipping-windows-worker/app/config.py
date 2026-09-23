@@ -44,6 +44,8 @@ class Settings(BaseSettings):
     youtube_privacy: str = "public"
     instagram_access_token: str | None = None
     instagram_ig_user_id: str | None = None
+    tiktok_access_token: str | None = None
+    tiktok_privacy: str = "SELF_ONLY"
 
     @property
     def downloads_dir(self) -> Path:
