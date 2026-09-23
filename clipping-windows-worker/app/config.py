@@ -42,6 +42,8 @@ class Settings(BaseSettings):
     youtube_client_secret: str | None = None
     youtube_refresh_token: str | None = None
     youtube_privacy: str = "public"
+    instagram_access_token: str | None = None
+    instagram_ig_user_id: str | None = None
 
     @property
     def downloads_dir(self) -> Path:
